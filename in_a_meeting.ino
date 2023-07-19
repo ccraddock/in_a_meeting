@@ -1,14 +1,20 @@
+
 //LIBRARIES
-#include <U8g2lib.h>
-#include <SPI.h>
-#include <WiFiNINA.h>
-#include <WiFiUdp.h>
-#include <utility/wifi_drv.h>
+
+#include <ArduinoBearSSL.h>
+#include <EasyNTPClient.h>
 #include <RTCZero.h>
+#include <SPI.h>
+#include <U8g2lib.h>
+#include <WiFiNINA.h>
+#include <utility/wifi_drv.h>
+#include <WiFiUdp.h>
+
+// #include <uICAL.h>
+
 #include <Timezone.h>    // https://github.com/JChristensen/Timezone
 
 #include "secrets.h"
-
 
 // setup time zone
 // US Central Time Zone (Austin)
@@ -35,14 +41,9 @@ int keyIndex = 0;            // your network key index number (needed only for W
 
 unsigned int localPort = 2390;      // local port to listen for UDP packets
 
-IPAddress timeServer(162, 159, 200, 123); // pool.ntp.org NTP server
-
-const int NTP_PACKET_SIZE = 48; // NTP timestamp is in the first 48 bytes of the message
-
-byte packetBuffer[NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing packets
-
 // A UDP instance to let us send and receive packets over UDP
-WiFiUDP Udp;
+WiFiUDP udp;
+EasyNTPClient ntpClient(udp, "pool.ntp.org", 0);
 
 // DEFINE DISPLAY/CONTROL OBJECTS 
 U8G2_SH1106_128X64_NONAME_1_HW_I2C u8g_panel(U8G2_R2, /* reset=*/ U8X8_PIN_NONE);
@@ -130,6 +131,68 @@ void print2digits(int number) {
   Serial.print(number);
 }
 
+unsigned long get_time(){
+  return rtc.getEpoch();
+}
+
+void calendar_update(){
+
+    Serial.println("Fetching: calendar!");
+
+    WiFiClient client;
+    BearSSLClient ssl_client(client);
+
+    ArduinoBearSSL.onGetTime(get_time);
+
+    char get_string[128];
+    snprintf(get_string, 128, "GET %s", CALENDAR_ENDPOINT);
+    Serial.print("Querying endpoint ");
+    Serial.println(CALENDAR_ENDPOINT);
+
+    if(ssl_client.connect(CALENDAR_SERVER, 443)) {
+      ssl_client.println(get_string);
+      ssl_client.println("Host: www.google.com");
+      ssl_client.println("Connection: close");
+      ssl_client.println();
+    }
+
+    while(ssl_client.available()){
+      char c = ssl_client.read();
+      Serial.write(c);
+    }
+
+    Serial.println("Finished reading.");
+    ssl_client.stop();
+    // uICAL::Calendar_ptr cal = nullptr;
+    // try {
+    //     uICAL::istream_Stream istm(https.getStream());
+    //     cal = uICAL::Calendar::load(istm);
+    // }
+    // catch (uICAL::Error ex) {
+    //     Serial.println("%s: %s", ex.message.c_str(), "! Failed loading calendar");
+    //     stop();
+    // }
+
+    // unsigned now = g_ntpClient.getUnixTime();
+
+    // uICAL::DateTime calBegin(now);
+    // uICAL::DateTime calEnd(now + 86400);
+
+    // uICAL::CalendarIter_ptr calIt = uICAL::new_ptr<uICAL::CalendarIter>(this->cal, calBegin, calEnd);
+
+    // while (calIt->next()) {
+    //     uICAL::CalendarEntry_ptr entry = calIt->current();
+    //     Serial.println("Event @ %s -> %s : %s",
+    //                     entry->start().as_str().c_str(),
+    //                     entry->end().as_str().c_str(),
+    //                     entry->summary().c_str());
+
+    // }
+
+    // stop();
+
+}
+
 // ************************************************
 void setup(void) {
   // Open serial communications and wait for port to open:
@@ -154,11 +217,6 @@ void setup(void) {
     while (true);
   }
 
-  String fv = WiFi.firmwareVersion();
-  if (fv < WIFI_FIRMWARE_LATEST_VERSION) {
-    Serial.println("Please upgrade the firmware");
-  }
-
   // attempt to connect to WiFi network:
   while (status != WL_CONNECTED) {
     Serial.print("Attempting to connect to SSID: ");
@@ -170,64 +228,22 @@ void setup(void) {
     delay(10000);
   }
 
-  // want led to be red until connection is established
-  RGB_LED(0,0,25);
-
   Serial.println("Connected to WiFi");
   printWifiStatus();
 
-  Serial.println("\nStarting connection to server...");
-  Udp.begin(localPort);
+  // now that wifi connection is established, 
+  // show blue
+  RGB_LED(0,0,25);
+
+  Serial.println("\nUpdating time from NTP server ...");
+  udp.begin(localPort);
  
   rtc.begin();
 
-  // set the time from a NTP server
-  sendNTPpacket(timeServer); // send an NTP packet to a time server
+  // set the RTC time
+  rtc.setEpoch(ntpClient.getUnixTime());
 
-  // wait to see if a reply is available
-  delay(1000);
-  if (Udp.parsePacket()) {
-    Serial.println("packet received");
-    // We've received a packet, read the data from it
-    Udp.read(packetBuffer, NTP_PACKET_SIZE); // read the packet into the buffer
-
-    //the timestamp starts at byte 40 of the received packet and is four bytes,
-    // or two words, long. First, extract the two words:
-
-    unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
-    unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
-    // combine the four bytes (two words) into a long integer
-    // this is NTP time (seconds since Jan 1 1900):
-    unsigned long secsSince1900 = highWord << 16 | lowWord;
-
-    // Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
-    const unsigned long seventyYears = 2208988800UL;
-    // subtract seventy years:
-    unsigned long epoch = secsSince1900 - seventyYears;
-
-    rtc.setEpoch(epoch); // Jan 1, 2016
-    
-    // print Unix time:
-    Serial.println(epoch);
-
-    Serial.print("UTC date and time: ");
-    Serial.print(rtc.getYear());
-    Serial.print("-");
-    print2digits(rtc.getMonth());
-    Serial.print("-");
-    print2digits(rtc.getDay());
-    Serial.print(". ");
-
-    // print the hour, minute and second:
-    // ...and time
-    print2digits(rtc.getHours());
-    Serial.print(":");
-    print2digits(rtc.getMinutes());
-    Serial.print(":");
-    print2digits(rtc.getSeconds());
-    Serial.println();
-  }
-
+  // now that time is set, go grean
   RGB_LED(0,25,0);
 
   // Set encoder pins as inputs
@@ -317,8 +333,14 @@ int getStateDurationStr(){
   return duration_string_to_center;
 }
 
+bool calendar_init = false;
+
 void loop(void) {
 
+  if (calendar_init == false){
+    calendar_update();
+    calendar_init = true;
+  }
   int begin = millis();
 
   makeDateStr();
@@ -385,37 +407,6 @@ void loop(void) {
   Serial.println(1000 - (millis()-begin));
   delay(1000 - (millis()-begin));
 } 
-
-// send an NTP request to the time server at the given address
-unsigned long sendNTPpacket(IPAddress& address) {
-  //Serial.println("1");
-  // set all bytes in the buffer to 0
-  memset(packetBuffer, 0, NTP_PACKET_SIZE);
-  // Initialize values needed to form NTP request
-  // (see URL above for details on the packets)
-  //Serial.println("2");
-  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
-  packetBuffer[1] = 0;     // Stratum, or type of clock
-  packetBuffer[2] = 6;     // Polling Interval
-  packetBuffer[3] = 0xEC;  // Peer Clock Precision
-  // 8 bytes of zero for Root Delay & Root Dispersion
-  packetBuffer[12]  = 49;
-  packetBuffer[13]  = 0x4E;
-  packetBuffer[14]  = 49;
-  packetBuffer[15]  = 52;
-
-  //Serial.println("3");
-
-  // all NTP fields have been given values, now
-  // you can send a packet requesting a timestamp:
-  Udp.beginPacket(address, 123); //NTP requests are to port 123
-  //Serial.println("4");
-  Udp.write(packetBuffer, NTP_PACKET_SIZE);
-  //Serial.println("5");
-  Udp.endPacket();
-  //Serial.println("6");
-}
-
 
 void printWifiStatus() {
   // print the SSID of the network you're attached to:
